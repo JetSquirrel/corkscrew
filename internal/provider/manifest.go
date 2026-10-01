@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -186,7 +187,7 @@ func LoadManifestDirectory(dir string) (ResolvedManifest, error) {
 	if err != nil {
 		return ResolvedManifest{}, fmt.Errorf("stat provider executable: %w", err)
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+	if !info.Mode().IsRegular() || !isExecutable(info, resolvedExecutable) {
 		return ResolvedManifest{}, fmt.Errorf("provider executable must be a regular executable file")
 	}
 	return ResolvedManifest{
@@ -194,4 +195,14 @@ func LoadManifestDirectory(dir string) (ResolvedManifest, error) {
 		ManifestPath:   manifestPath,
 		ExecutablePath: resolvedExecutable,
 	}, nil
+}
+
+// isExecutable reports whether a provider file can be run. Windows has no
+// execute bit — Go reports every file there as 0666 or 0444 — so a file
+// runs by its extension; elsewhere the mode bits decide.
+func isExecutable(info os.FileInfo, path string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(filepath.Ext(path), ".exe")
+	}
+	return info.Mode().Perm()&0o111 != 0
 }
