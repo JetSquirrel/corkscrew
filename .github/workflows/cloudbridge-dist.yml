@@ -1,15 +1,18 @@
-# Builds the corkscrew CLI and its AWS provider plugin, packaged the way
-# CloudBridge installs and runs them, and publishes them as a release.
+# Builds the corkscrew CLI and its AWS and Cloudflare provider plugins,
+# packaged the way CloudBridge installs and runs them, and publishes them
+# as a release.
 #
 # Upstream's release archives ship the plugin sources but no built plugin,
 # so a scanner cannot run from them as downloaded. This workflow builds
-# both on native runners (the CLI links DuckDB through cgo) and lays them
+# them on native runners (the CLI links DuckDB through cgo) and lays them
 # out as corkscrew resolves a local plugin root relative to its working
 # directory:
 #
 #   corkscrew[.exe]
 #   build/bin/plugins/official/aws/aws-provider[.exe]
 #   build/bin/plugins/official/aws/plugin.json
+#   build/bin/plugins/official/cloudflare/cloudflare-provider[.exe]
+#   build/bin/plugins/official/cloudflare/plugin.json
 #
 # Push a tag named cloudbridge-r<N> to publish.
 name: CloudBridge distribution
@@ -45,7 +48,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build CLI and AWS plugin
+      - name: Build CLI and provider plugins
         shell: bash
         env:
           CGO_ENABLED: '1'
@@ -56,17 +59,24 @@ jobs:
           test "$(go env GOARCH)" = "$TARGET_ARCH"
           ext=""
           if [ "$TARGET_OS" = windows ]; then ext=".exe"; fi
-          plugin_dir=package/build/bin/plugins/official/aws
-          mkdir -p "$plugin_dir"
           go build -trimpath \
             -ldflags "-s -w -X main.version=${GITHUB_REF_NAME} -X main.commit=${GITHUB_SHA}" \
             -o "package/corkscrew${ext}" ./cmd/corkscrew
-          (cd plugins/aws-provider && go build -trimpath -tags=aws_services -ldflags "-s -w" \
-            -o "../../${plugin_dir}/aws-provider${ext}" .)
-          # The manifest names the file exactly; on Windows that is the .exe.
-          sed "s/\"executable\": \"aws-provider\"/\"executable\": \"aws-provider${ext}\"/" \
-            plugins/aws-provider/plugin.json > "${plugin_dir}/plugin.json"
-          grep -q "\"executable\": \"aws-provider${ext}\"" "${plugin_dir}/plugin.json"
+          # build_plugin <provider> [go build flags...]
+          build_plugin() {
+            local provider="$1"; shift
+            local binary="${provider}-provider"
+            local plugin_dir="package/build/bin/plugins/official/${provider}"
+            mkdir -p "$plugin_dir"
+            (cd "plugins/${binary}" && go build -trimpath "$@" -ldflags "-s -w" \
+              -o "../../${plugin_dir}/${binary}${ext}" .)
+            # The manifest names the file exactly; on Windows that is the .exe.
+            sed "s/\"executable\": \"${binary}\"/\"executable\": \"${binary}${ext}\"/" \
+              "plugins/${binary}/plugin.json" > "${plugin_dir}/plugin.json"
+            grep -q "\"executable\": \"${binary}${ext}\"" "${plugin_dir}/plugin.json"
+          }
+          build_plugin aws -tags=aws_services
+          build_plugin cloudflare
           cp LICENSE package/LICENSE
 
       - name: Smoke-test the package
@@ -75,10 +85,13 @@ jobs:
           cd package
           ext=""; if [ "${{ matrix.goos }}" = windows ]; then ext=".exe"; fi
           "./corkscrew${ext}" --help > /dev/null
-          # The plugin must be found where CloudBridge will run it from.
-          "./corkscrew${ext}" plugin status aws | tee status.txt
-          grep -q 'installed=true' status.txt
+          # The plugins must be found where CloudBridge will run them from.
+          for provider in aws cloudflare; do
+            "./corkscrew${ext}" plugin status "$provider" | tee status.txt
+            grep -q 'installed=true' status.txt
+          done
           rm status.txt
+          "./build/bin/plugins/official/cloudflare/cloudflare-provider${ext}" -test
 
       - name: Package (Unix)
         if: matrix.goos != 'windows'
@@ -120,4 +133,4 @@ jobs:
         run: |
           gh release create "${GITHUB_REF_NAME}" dist/* \
             --title "${GITHUB_REF_NAME}" \
-            --notes "corkscrew CLI and AWS provider plugin, built from ${GITHUB_SHA} for CloudBridge's Insights page. Includes the fixes proposed in jlgore/corkscrew#22."
+            --notes "corkscrew CLI with the AWS and Cloudflare provider plugins, built from ${GITHUB_SHA} for CloudBridge's Insights page. Includes the fixes proposed in jlgore/corkscrew#22 and the scan service-group fix that lets Cloudflare scan its storage service."
