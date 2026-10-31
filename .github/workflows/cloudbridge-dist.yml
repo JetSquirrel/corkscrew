@@ -133,4 +133,4 @@ jobs:
         run: |
           gh release create "${GITHUB_REF_NAME}" dist/* \
             --title "${GITHUB_REF_NAME}" \
-            --notes "corkscrew CLI with the AWS and Cloudflare provider plugins, built from ${GITHUB_SHA} for CloudBridge's Insights page. Includes the fixes proposed in jlgore/corkscrew#22 and the scan service-group fix that lets Cloudflare scan its storage service."
+            --notes "corkscrew CLI with the AWS and Cloudflare provider plugins, built from ${GITHUB_SHA} for CloudBridge's Insights page. Built from upstream jlgore/corkscrew main plus this distribution's packaging."

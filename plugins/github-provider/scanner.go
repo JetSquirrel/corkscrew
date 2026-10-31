@@ -2,13 +2,20 @@ package main
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/google/go-github/v71/github"
+	"github.com/jlgore/corkscrew/internal/assert"
 	pb "github.com/jlgore/corkscrew/internal/proto"
+	"github.com/jlgore/corkscrew/internal/shared"
+	"github.com/jlgore/corkscrew/internal/shared/paging"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -101,43 +108,58 @@ func (p *GitHubProvider) scanActions(ctx context.Context) ([]*pb.Resource, []str
 		var res []*pb.Resource
 		var errs []string
 		res = append(res, p.listRepoRunners(ctx, repo, &errs)...)
-		var workflows struct {
-			TotalCount int `json:"total_count"`
-			Workflows  []struct {
-				ID        int64  `json:"id"`
-				NodeID    string `json:"node_id"`
-				Name      string `json:"name"`
-				Path      string `json:"path"`
-				State     string `json:"state"`
-				HTMLURL   string `json:"html_url"`
-				CreatedAt string `json:"created_at"`
-				UpdatedAt string `json:"updated_at"`
-			} `json:"workflows"`
-		}
-		if err := p.getREST(ctx, fmt.Sprintf("repos/%s/%s/actions/workflows", owner, name), &workflows); err != nil {
-			appendAPIError(&errs, "actions workflows", repo.GetFullName(), err)
-			return res, errs
-		}
-		for _, workflow := range workflows.Workflows {
+		res = append(res, p.workflowResources(ctx, repo, owner, name, &errs)...)
+		return res, errs
+	})
+	return append(orgRunners, parRes...), append(listErrors, parErrs...)
+}
+
+type workflowItem struct {
+	ID        int64  `json:"id"`
+	NodeID    string `json:"node_id"`
+	Name      string `json:"name"`
+	Path      string `json:"path"`
+	State     string `json:"state"`
+	HTMLURL   string `json:"html_url"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+type workflowsPage struct {
+	TotalCount int            `json:"total_count"`
+	Workflows  []workflowItem `json:"workflows"`
+}
+
+// workflowResources pages through every workflow. A single request stopped at GitHub's default
+// page of 30 and silently dropped the rest of a repository's workflows.
+func (p *GitHubProvider) workflowResources(
+	ctx context.Context, repo *github.Repository, owner, name string, errors *[]string,
+) []*pb.Resource {
+	var res []*pb.Resource
+	path := fmt.Sprintf("repos/%s/%s/actions/workflows?per_page=%d", owner, name, restPerPage)
+	err := getRESTPages(ctx, p, "workflows "+repo.GetFullName(), path, func(page *workflowsPage) {
+		for _, workflow := range page.Workflows {
 			id := workflow.NodeID
 			if id == "" {
 				id = fmt.Sprintf("%s/actions/workflows/%d", repo.GetFullName(), workflow.ID)
 			}
-			res = append(res, p.resource("actions", "workflow", id, workflow.Name, workflow, map[string]string{
-				"repository": repo.GetFullName(),
-				"path":       workflow.Path,
-				"state":      workflow.State,
-			}))
+			res = append(res, p.resource("actions", "workflow", id, workflow.Name, workflow,
+				map[string]string{
+					"repository": repo.GetFullName(),
+					"path":       workflow.Path,
+					"state":      workflow.State,
+				}))
 		}
-		return res, errs
 	})
-	return append(orgRunners, parRes...), append(listErrors, parErrs...)
+	appendAPIError(errors, "actions workflows", repo.GetFullName(), err)
+	return res
 }
 
 func (p *GitHubProvider) scanAccess(ctx context.Context) ([]*pb.Resource, []string) {
 	var resources []*pb.Resource
 	var errors []string
 	opt := &github.ListOptions{PerPage: 100}
+	guard := paging.New("teams "+p.org, paging.PagesMax)
 	for {
 		teams, resp, err := p.client.Teams.ListTeams(ctx, p.org, opt)
 		if err != nil {
@@ -151,6 +173,10 @@ func (p *GitHubProvider) scanAccess(ctx context.Context) ([]*pb.Resource, []stri
 			}))
 		}
 		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		if err := guard.Next(strconv.Itoa(resp.NextPage)); err != nil {
+			appendAPIError(&errors, "teams", p.org, err)
 			break
 		}
 		opt.Page = resp.NextPage
@@ -214,6 +240,10 @@ func (p *GitHubProvider) parallelRepos(
 	var resources []*pb.Resource
 	var errors []string
 
+	// The label matters: a bare break inside the select would only leave the
+	// select, and the loop would then start a goroutine that never acquired a
+	// slot. That goroutine's release (<-sem) can block forever, hanging Wait.
+repoLoop:
 	for _, repo := range repos {
 		if ctx.Err() != nil {
 			break
@@ -222,7 +252,7 @@ func (p *GitHubProvider) parallelRepos(
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
-			break
+			break repoLoop
 		}
 		wg.Add(1)
 		go func() {
@@ -239,12 +269,37 @@ func (p *GitHubProvider) parallelRepos(
 	return resources, errors
 }
 
-// listRepos prefers GraphQL, which returns repo metadata + default branch
+// listRepos returns the org's repositories, listing them once per scan: every later service of
+// the scan reuses the scan cache's list. A listing that reported errors is not cached, so the
+// next service retries it rather than scanning a possibly truncated list again, and reports its
+// own errors, as each service did before the cache.
+func (p *GitHubProvider) listRepos(ctx context.Context) ([]*github.Repository, []string) {
+	cache := scanCacheFrom(ctx)
+	if cache == nil {
+		return p.listReposUncached(ctx)
+	}
+
+	cache.reposMu.Lock()
+	defer cache.reposMu.Unlock()
+
+	if cache.reposListed {
+		return cache.repos, nil
+	}
+	assert.That(cache.repos == nil, "github: repository cache holds only repositories it listed")
+	repos, errors := p.listReposUncached(ctx)
+	if len(errors) == 0 {
+		cache.repos = repos
+		cache.reposListed = true
+	}
+	return repos, errors
+}
+
+// listReposUncached prefers GraphQL, which returns repo metadata + default branch
 // protection rule in a single paginated query (eliminating the per-repo REST
 // roundtrip for branch protection on subsequent scan paths). Falls back to
 // REST on Enterprise (no GraphQL client built) or any GraphQL error so the
 // scanner is never worse than the REST-only baseline.
-func (p *GitHubProvider) listRepos(ctx context.Context) ([]*github.Repository, []string) {
+func (p *GitHubProvider) listReposUncached(ctx context.Context) ([]*github.Repository, []string) {
 	if p.gqlClient != nil {
 		repos, err := p.listReposGraphQL(ctx)
 		if err == nil {
@@ -259,6 +314,7 @@ func (p *GitHubProvider) listReposREST(ctx context.Context) ([]*github.Repositor
 	var repos []*github.Repository
 	var errors []string
 	opt := &github.RepositoryListByOrgOptions{Type: "all", ListOptions: github.ListOptions{PerPage: 100}}
+	guard := paging.New("repositories "+p.org, paging.PagesMax)
 	for {
 		page, resp, err := p.client.Repositories.ListByOrg(ctx, p.org, opt)
 		if err != nil {
@@ -267,6 +323,9 @@ func (p *GitHubProvider) listReposREST(ctx context.Context) ([]*github.Repositor
 		repos = append(repos, page...)
 		if resp == nil || resp.NextPage == 0 {
 			break
+		}
+		if err := guard.Next(strconv.Itoa(resp.NextPage)); err != nil {
+			return repos, []string{err.Error()}
 		}
 		opt.Page = resp.NextPage
 	}
@@ -286,8 +345,8 @@ func (p *GitHubProvider) repoResource(repo *github.Repository) *pb.Resource {
 // checkBranchProtection returns a structured status. A 404 means the branch
 // genuinely has no protection; any other error (403 Forbidden, 5xx, transport)
 // becomes bpUnknown so callers don't synthesize a false-positive finding.
-// Results are cached per provider instance so BatchScan doesn't re-fetch
-// across `repos` and `findings` services.
+// Known results are cached for the current scan (see withScanCache) so
+// BatchScan doesn't re-fetch across `repos` and `findings` services.
 func (p *GitHubProvider) checkBranchProtection(ctx context.Context, repo *github.Repository, errors *[]string) branchProtectionState {
 	owner, name := repoOwnerName(repo)
 	branch := repo.GetDefaultBranch()
@@ -295,8 +354,11 @@ func (p *GitHubProvider) checkBranchProtection(ctx context.Context, repo *github
 		return branchProtectionState{status: bpNoBranch}
 	}
 	key := fmt.Sprintf("%s/%s@%s", owner, name, branch)
-	if cached, ok := p.protectionCache.Load(key); ok {
-		return cached.(branchProtectionState)
+	cache := protectionCacheFrom(ctx)
+	if cache != nil {
+		if cached, ok := cache.Load(key); ok {
+			return cached.(branchProtectionState)
+		}
 	}
 
 	protection, resp, err := p.client.Repositories.GetBranchProtection(ctx, owner, name, branch)
@@ -318,17 +380,71 @@ func (p *GitHubProvider) checkBranchProtection(ctx context.Context, repo *github
 		appendAPIError(errors, "branch protection", repo.GetFullName(), err)
 		state = branchProtectionState{status: bpUnknown}
 	}
-	p.protectionCache.Store(key, state)
+	// Unknown usually means a transient failure (5xx, rate limit, network). Caching it would make
+	// the next service in the scan skip the retry and report the repository as unknown again.
+	if cache != nil && state.status != bpUnknown {
+		cache.Store(key, state)
+	}
 	return state
+}
+
+type scanCacheKey struct{}
+
+// scanCache holds what one scan has already fetched, so the services of a BatchScan share it:
+// the default batch (repos, security, findings) used to list every repository three times and
+// fetch every alert listing twice. It lives in the scan's ctx and never on the provider: a cache
+// that outlived the scan made a later scan report the state an earlier one saw.
+type scanCache struct {
+	// protection maps "owner/name@branch" to branchProtectionState.
+	protection sync.Map
+
+	// reposMu is held for the whole listing, so a second caller waits for the first listing
+	// rather than starting its own. Services run in sequence, so it is rarely contended.
+	reposMu     sync.Mutex
+	reposListed bool
+	repos       []*github.Repository
+
+	// alerts maps alertCacheKey to alertListing.
+	alerts      sync.Map
+	alertsCount atomic.Int64
+}
+
+// alertListing is one alert endpoint's result for one repository: the alerts and the notices
+// the listing reported, which a cache hit replays so every service still reports them.
+type alertListing struct {
+	items   []alertItem
+	notices []string
+}
+
+// withScanCache returns ctx carrying the cache for one scan, reusing one already in ctx.
+func withScanCache(ctx context.Context) context.Context {
+	if scanCacheFrom(ctx) != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, scanCacheKey{}, &scanCache{})
+}
+
+// scanCacheFrom returns the scan's cache, or nil outside a scan, in which case callers neither
+// read nor store.
+func scanCacheFrom(ctx context.Context) *scanCache {
+	cache, _ := ctx.Value(scanCacheKey{}).(*scanCache)
+	return cache
+}
+
+// protectionCacheFrom returns the scan's branch protection cache, or nil outside a scan.
+func protectionCacheFrom(ctx context.Context) *sync.Map {
+	cache := scanCacheFrom(ctx)
+	if cache == nil {
+		return nil
+	}
+	return &cache.protection
 }
 
 func (p *GitHubProvider) rulesetResources(ctx context.Context, repo *github.Repository, errors *[]string) []*pb.Resource {
 	owner, name := repoOwnerName(repo)
-	var rulesets []map[string]interface{}
-	if err := p.getREST(ctx, fmt.Sprintf("repos/%s/%s/rulesets", owner, name), &rulesets); err != nil {
-		appendAPIError(errors, "rulesets", repo.GetFullName(), err)
-		return nil
-	}
+	path := fmt.Sprintf("repos/%s/%s/rulesets?per_page=%d", owner, name, restPerPage)
+	rulesets, err := p.getRESTMaps(ctx, "rulesets "+repo.GetFullName(), path)
+	appendAPIError(errors, "rulesets", repo.GetFullName(), err)
 	resources := make([]*pb.Resource, 0, len(rulesets))
 	for _, ruleset := range rulesets {
 		id := fmt.Sprintf("%v", ruleset["id"])
@@ -339,30 +455,94 @@ func (p *GitHubProvider) rulesetResources(ctx context.Context, repo *github.Repo
 }
 
 func (p *GitHubProvider) dependabotAlerts(ctx context.Context, owner, repo string, errors *[]string) []alertItem {
-	var alerts []map[string]interface{}
-	if err := p.getREST(ctx, fmt.Sprintf("repos/%s/%s/dependabot/alerts?state=open&per_page=100", owner, repo), &alerts); err != nil {
-		appendAPIError(errors, "dependabot alerts", owner+"/"+repo, err)
-		return nil
-	}
-	return p.buildAlertItems("dependabot_alert", owner+"/"+repo, alerts, dependabotSeverity)
+	return p.cachedAlerts(ctx, alertSource{
+		operation: "dependabot alerts", alertType: "dependabot_alert", endpoint: "dependabot",
+		severity: dependabotSeverity,
+	}, owner, repo, errors)
 }
 
 func (p *GitHubProvider) secretScanningAlerts(ctx context.Context, owner, repo string, errors *[]string) []alertItem {
-	var alerts []map[string]interface{}
-	if err := p.getREST(ctx, fmt.Sprintf("repos/%s/%s/secret-scanning/alerts?state=open&per_page=100", owner, repo), &alerts); err != nil {
-		appendAPIError(errors, "secret scanning alerts", owner+"/"+repo, err)
-		return nil
-	}
-	return p.buildAlertItems("secret_scanning_alert", owner+"/"+repo, alerts, secretScanningSeverity)
+	return p.cachedAlerts(ctx, alertSource{
+		operation: "secret scanning alerts", alertType: "secret_scanning_alert",
+		endpoint: "secret-scanning", severity: secretScanningSeverity,
+	}, owner, repo, errors)
 }
 
 func (p *GitHubProvider) codeScanningAlerts(ctx context.Context, owner, repo string, errors *[]string) []alertItem {
-	var alerts []map[string]interface{}
-	if err := p.getREST(ctx, fmt.Sprintf("repos/%s/%s/code-scanning/alerts?state=open&per_page=100", owner, repo), &alerts); err != nil {
-		appendAPIError(errors, "code scanning alerts", owner+"/"+repo, err)
-		return nil
+	return p.cachedAlerts(ctx, alertSource{
+		operation: "code scanning alerts", alertType: "code_scanning_alert",
+		endpoint: "code-scanning", severity: codeScanningSeverity,
+	}, owner, repo, errors)
+}
+
+// alertSource describes one of the three per-repository alert endpoints.
+type alertSource struct {
+	operation string // names the listing in errors and notices
+	alertType string // the resource type of each alert
+	endpoint  string // the path segment under repos/{owner}/{repo}/
+	severity  func(map[string]interface{}) string
+}
+
+// alertSourcesCount is the number of alertSource values above; the cache bound counts on it.
+const alertSourcesCount = 3
+
+// alertCacheEntriesMax bounds the scan's alert cache at one entry per alert source per
+// repository a listing can return (paging.PagesMax pages of restPerPage repositories).
+const alertCacheEntriesMax = alertSourcesCount * paging.PagesMax * restPerPage
+
+// alertCacheKey identifies one alert listing of one repository within a scan.
+type alertCacheKey struct {
+	endpoint string
+	repo     string
+}
+
+// cachedAlerts lists source's open alerts for owner/repo once per scan: `security` and
+// `findings` both read every repository's alerts. A listing that ended in a notice (403/404) is
+// cached with its notices, which a hit replays. Any other failure is not cached, so the next
+// service retries it instead of repeating what is usually a transient error.
+func (p *GitHubProvider) cachedAlerts(
+	ctx context.Context, source alertSource, owner, repo string, errors *[]string,
+) []alertItem {
+	assert.That(source.endpoint != "", "github: alert source has an endpoint")
+	cache := scanCacheFrom(ctx)
+	key := alertCacheKey{endpoint: source.endpoint, repo: owner + "/" + repo}
+	if cache != nil {
+		if cached, ok := cache.alerts.Load(key); ok {
+			listing := cached.(alertListing)
+			*errors = append(*errors, listing.notices...)
+			return listing.items
+		}
 	}
-	return p.buildAlertItems("code_scanning_alert", owner+"/"+repo, alerts, codeScanningSeverity)
+
+	var entries []string
+	items := p.listAlerts(ctx, source, owner, repo, &entries)
+	*errors = append(*errors, entries...)
+	if cache == nil {
+		return items
+	}
+	for _, entry := range entries {
+		if !shared.IsScanNotice(entry) {
+			return items
+		}
+	}
+	if cache.alertsCount.Load() < alertCacheEntriesMax {
+		if _, loaded := cache.alerts.LoadOrStore(key, alertListing{items, entries}); !loaded {
+			cache.alertsCount.Add(1)
+		}
+	}
+	return items
+}
+
+// listAlerts fetches every page of source's open alerts for owner/repo.
+func (p *GitHubProvider) listAlerts(
+	ctx context.Context, source alertSource, owner, repo string, errors *[]string,
+) []alertItem {
+	fullName := owner + "/" + repo
+	path := fmt.Sprintf("repos/%s/%s/%s/alerts?state=open&per_page=%d",
+		owner, repo, source.endpoint, restPerPage)
+	alerts, err := p.getRESTMaps(ctx, source.operation+" "+fullName, path)
+	appendAPIError(errors, source.operation, fullName, err)
+	return p.buildAlertItems(source.alertType, fullName, alerts, source.severity)
 }
 
 func (p *GitHubProvider) buildAlertItems(alertType, repo string, alerts []map[string]interface{}, severityFn func(map[string]interface{}) string) []alertItem {
@@ -511,13 +691,104 @@ func (p *GitHubProvider) resource(service, typ, id, name string, raw interface{}
 }
 
 func (p *GitHubProvider) getREST(ctx context.Context, path string, out interface{}) error {
+	_, err := p.getRESTResponse(ctx, path, out)
+	return err
+}
+
+func (p *GitHubProvider) getRESTResponse(
+	ctx context.Context, path string, out interface{},
+) (*github.Response, error) {
 	path = strings.TrimPrefix(path, "/")
 	req, err := p.client.NewRequest("GET", path, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = p.client.Do(ctx, req, out)
-	return err
+	return p.client.Do(ctx, req, out)
+}
+
+// restPerPage is GitHub's largest REST page size; the default of 30 needs over 3x the requests.
+const restPerPage = 100
+
+// getRESTPages GETs path and then every rel="next" page from the Link header, decoding each
+// page into a fresh P for onPage. Following the Link URL verbatim covers both page numbers and
+// the before/after cursors the alert endpoints use. Pages already handed to onPage stay
+// delivered when a later page fails, so callers keep the resources they observed.
+func getRESTPages[P any](
+	ctx context.Context, p *GitHubProvider, label, path string, onPage func(*P),
+) error {
+	guard := paging.New(label, paging.PagesMax)
+	next := path
+	for {
+		var page P
+		resp, err := p.getRESTResponse(ctx, next, &page)
+		if err != nil {
+			return err
+		}
+		onPage(&page)
+		next, err = p.nextPageURL(resp)
+		if err != nil {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		if next == "" {
+			return nil
+		}
+		if err := guard.Next(next); err != nil {
+			return err
+		}
+	}
+}
+
+// getRESTMaps pages through a REST endpoint whose body is a JSON array of objects.
+func (p *GitHubProvider) getRESTMaps(
+	ctx context.Context, label, path string,
+) ([]map[string]interface{}, error) {
+	var items []map[string]interface{}
+	err := getRESTPages(ctx, p, label, path, func(page *[]map[string]interface{}) {
+		items = append(items, *page...)
+	})
+	return items, err
+}
+
+// nextPageURL returns the rel="next" URL from resp's Link header, or "" on the last page. The
+// URL comes from the server and the request carries our credentials, so a link to any scheme or
+// host other than the API base is refused rather than followed.
+func (p *GitHubProvider) nextPageURL(resp *github.Response) (string, error) {
+	if resp == nil || resp.Response == nil {
+		return "", nil
+	}
+	next := linkNext(resp.Header.Get("Link"))
+	if next == "" {
+		return "", nil
+	}
+	target, err := url.Parse(next)
+	if err != nil {
+		return "", fmt.Errorf("parse next page link %q: %w", next, err)
+	}
+	base := p.client.BaseURL
+	if target.Scheme != base.Scheme || target.Host != base.Host {
+		return "", fmt.Errorf("next page link %q leaves API host %s", next, base.Host)
+	}
+	return next, nil
+}
+
+// linkNext extracts the rel="next" target from an RFC 8288 Link header value.
+func linkNext(header string) string {
+	for _, link := range strings.Split(header, ",") {
+		segments := strings.Split(strings.TrimSpace(link), ";")
+		if len(segments) < 2 {
+			continue
+		}
+		target := strings.TrimSpace(segments[0])
+		if !strings.HasPrefix(target, "<") || !strings.HasSuffix(target, ">") {
+			continue
+		}
+		for _, param := range segments[1:] {
+			if strings.TrimSpace(param) == `rel="next"` {
+				return target[1 : len(target)-1]
+			}
+		}
+	}
+	return ""
 }
 
 func repoOwnerName(repo *github.Repository) (string, string) {
@@ -541,13 +812,25 @@ func compactResources(resources []*pb.Resource) []*pb.Resource {
 	return compact
 }
 
+// appendAPIError records err for one listing. A 403 means the token lacks the scope and a 404
+// means the feature is off (or hidden from this token) for target: both describe the scan's
+// coverage, so they are notices and the scan stays comparable (ADR 0023). Rate limits are retried
+// by the transport before reaching here. Any other failure is an error: resources may be missing.
 func appendAPIError(errors *[]string, operation, target string, err error) {
 	if err == nil {
 		return
 	}
-	if ghErr, ok := err.(*github.ErrorResponse); ok && (ghErr.Response.StatusCode == http.StatusForbidden || ghErr.Response.StatusCode == http.StatusNotFound) {
-		*errors = append(*errors, fmt.Sprintf("%s %s skipped: %s", operation, target, ghErr.Response.Status))
-		return
+	subject := operation + " " + target
+	var ghErr *github.ErrorResponse
+	if stderrors.As(err, &ghErr) && ghErr.Response != nil {
+		switch ghErr.Response.StatusCode {
+		case http.StatusForbidden:
+			*errors = append(*errors, shared.AccessDeniedNotice(subject, fmt.Errorf("%s", ghErr.Response.Status)))
+			return
+		case http.StatusNotFound:
+			*errors = append(*errors, shared.NotEnabledNotice(subject, ghErr.Response.Status))
+			return
+		}
 	}
-	*errors = append(*errors, fmt.Sprintf("%s %s failed: %v", operation, target, err))
+	*errors = append(*errors, fmt.Sprintf("%s failed: %v", subject, err))
 }

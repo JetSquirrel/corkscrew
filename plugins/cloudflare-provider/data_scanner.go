@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	cloudflare "github.com/cloudflare/cloudflare-go/v6"
 	"github.com/cloudflare/cloudflare-go/v6/d1"
@@ -15,54 +16,48 @@ import (
 
 func (p *CloudflareProvider) scanData(ctx context.Context) ([]*pb.Resource, []string) {
 	accountIDs, err := p.accountIDsForWorkers(ctx)
-	if err != nil {
-		return nil, []string{fmt.Sprintf("accounts list failed: %v", err)}
-	}
-
 	resources := make([]*pb.Resource, 0)
 	var errs []string
+	if err != nil {
+		errs = append(errs, fmt.Sprintf("accounts list failed: %v", err))
+	}
 
 	for _, accountID := range accountIDs {
 		databases, err := p.listD1Databases(ctx, accountID)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("d1 databases list failed for account %s: %v", accountID, err))
-		} else {
-			for _, database := range databases {
-				resources = append(resources, p.d1DatabaseResource(accountID, database))
-			}
+		}
+		for _, database := range databases {
+			resources = append(resources, p.d1DatabaseResource(accountID, database))
 		}
 
 		namespaces, err := p.listDurableObjectNamespaces(ctx, accountID)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("durable object namespaces list failed for account %s: %v", accountID, err))
-		} else {
-			for _, namespace := range namespaces {
-				resources = append(resources, p.durableObjectNamespaceResource(accountID, namespace))
-				objects, err := p.listDurableObjects(ctx, accountID, namespace.ID)
-				if err != nil {
-					errs = append(errs, fmt.Sprintf("durable objects list failed for namespace %s: %v", namespace.ID, err))
-					continue
-				}
-				for _, object := range objects {
-					resources = append(resources, p.durableObjectResource(accountID, namespace.ID, namespace.Name, object))
-				}
+		}
+		for _, namespace := range namespaces {
+			resources = append(resources, p.durableObjectNamespaceResource(accountID, namespace))
+			objects, err := p.listDurableObjects(ctx, accountID, namespace.ID)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("durable objects list failed for namespace %s: %v", namespace.ID, err))
+			}
+			for _, object := range objects {
+				resources = append(resources, p.durableObjectResource(accountID, namespace.ID, namespace.Name, object))
 			}
 		}
 
 		stores, err := p.listSecretStores(ctx, accountID)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("secret stores list failed for account %s: %v", accountID, err))
-		} else {
-			for _, store := range stores {
-				resources = append(resources, p.secretStoreResource(accountID, store))
-				secrets, err := p.listSecretStoreSecrets(ctx, accountID, store.ID)
-				if err != nil {
-					errs = append(errs, fmt.Sprintf("secret store secrets list failed for store %s: %v", store.ID, err))
-					continue
-				}
-				for _, secret := range secrets {
-					resources = append(resources, p.secretStoreSecretListResource(accountID, store.ID, store.Name, secret))
-				}
+		}
+		for _, store := range stores {
+			resources = append(resources, p.secretStoreResource(accountID, store))
+			secrets, err := p.listSecretStoreSecrets(ctx, accountID, store.ID)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("secret store secrets list failed for store %s: %v", store.ID, err))
+			}
+			for _, secret := range secrets {
+				resources = append(resources, p.secretStoreSecretListResource(accountID, store.ID, store.Name, secret))
 			}
 		}
 	}
@@ -71,63 +66,42 @@ func (p *CloudflareProvider) scanData(ctx context.Context) ([]*pb.Resource, []st
 }
 
 func (p *CloudflareProvider) listD1Databases(ctx context.Context, accountID string) ([]d1.DatabaseListResponse, error) {
-	iter := p.client.D1.Database.ListAutoPaging(ctx, d1.DatabaseListParams{AccountID: cloudflare.F(accountID)})
-	results := make([]d1.DatabaseListResponse, 0)
-	for iter.Next() {
-		results = append(results, iter.Current())
-	}
-	if err := iter.Err(); err != nil {
-		return nil, err
-	}
-	return results, nil
+	return memoizedList(ctx, "d1/"+accountID, func() ([]d1.DatabaseListResponse, error) {
+		params := d1.DatabaseListParams{AccountID: cloudflare.F(accountID)}
+		iter := p.client.D1.Database.ListAutoPaging(ctx, params)
+		return collectAutoPaging(iter)
+	})
 }
 
 func (p *CloudflareProvider) listDurableObjectNamespaces(ctx context.Context, accountID string) ([]durable_objects.Namespace, error) {
-	iter := p.client.DurableObjects.Namespaces.ListAutoPaging(ctx, durable_objects.NamespaceListParams{AccountID: cloudflare.F(accountID)})
-	results := make([]durable_objects.Namespace, 0)
-	for iter.Next() {
-		results = append(results, iter.Current())
-	}
-	if err := iter.Err(); err != nil {
-		return nil, err
-	}
-	return results, nil
+	return memoizedList(ctx, "do/"+accountID, func() ([]durable_objects.Namespace, error) {
+		params := durable_objects.NamespaceListParams{AccountID: cloudflare.F(accountID)}
+		iter := p.client.DurableObjects.Namespaces.ListAutoPaging(ctx, params)
+		return collectAutoPaging(iter)
+	})
 }
 
 func (p *CloudflareProvider) listDurableObjects(ctx context.Context, accountID, namespaceID string) ([]durable_objects.DurableObject, error) {
 	iter := p.client.DurableObjects.Namespaces.Objects.ListAutoPaging(ctx, namespaceID, durable_objects.NamespaceObjectListParams{AccountID: cloudflare.F(accountID)})
-	results := make([]durable_objects.DurableObject, 0)
-	for iter.Next() {
-		results = append(results, iter.Current())
-	}
-	if err := iter.Err(); err != nil {
-		return nil, err
-	}
-	return results, nil
+	return collectAutoPaging(iter)
 }
 
 func (p *CloudflareProvider) listSecretStores(ctx context.Context, accountID string) ([]secrets_store.StoreListResponse, error) {
-	iter := p.client.SecretsStore.Stores.ListAutoPaging(ctx, secrets_store.StoreListParams{AccountID: cloudflare.F(accountID)})
-	results := make([]secrets_store.StoreListResponse, 0)
-	for iter.Next() {
-		results = append(results, iter.Current())
-	}
-	if err := iter.Err(); err != nil {
-		return nil, err
-	}
-	return results, nil
+	type store = secrets_store.StoreListResponse
+	return memoizedList(ctx, "stores/"+accountID, func() ([]store, error) {
+		params := secrets_store.StoreListParams{AccountID: cloudflare.F(accountID)}
+		iter := p.client.SecretsStore.Stores.ListAutoPaging(ctx, params)
+		return collectAutoPaging(iter)
+	})
 }
 
 func (p *CloudflareProvider) listSecretStoreSecrets(ctx context.Context, accountID, storeID string) ([]secrets_store.StoreSecretListResponse, error) {
-	iter := p.client.SecretsStore.Stores.Secrets.ListAutoPaging(ctx, storeID, secrets_store.StoreSecretListParams{AccountID: cloudflare.F(accountID)})
-	results := make([]secrets_store.StoreSecretListResponse, 0)
-	for iter.Next() {
-		results = append(results, iter.Current())
-	}
-	if err := iter.Err(); err != nil {
-		return nil, err
-	}
-	return results, nil
+	type secret = secrets_store.StoreSecretListResponse
+	return memoizedList(ctx, "stores/"+accountID+"/"+storeID, func() ([]secret, error) {
+		params := secrets_store.StoreSecretListParams{AccountID: cloudflare.F(accountID)}
+		iter := p.client.SecretsStore.Stores.Secrets.ListAutoPaging(ctx, storeID, params)
+		return collectAutoPaging(iter)
+	})
 }
 
 func (p *CloudflareProvider) d1DatabaseResource(accountID string, database d1.DatabaseListResponse) *pb.Resource {
@@ -211,6 +185,7 @@ func (p *CloudflareProvider) secretStoreSecretListResource(accountID, storeID, s
 		"status":     string(secret.Status),
 		"comment":    secret.Comment,
 	}
+	addSecretTimes(attrs, secret.Created, secret.Modified)
 	if len(secret.Scopes) > 0 {
 		attrs["scopes"] = strings.Join(secret.Scopes, ",")
 	}
@@ -234,6 +209,7 @@ func (p *CloudflareProvider) secretStoreSecretResource(accountID, storeID, store
 		"status":     string(secret.Status),
 		"comment":    secret.Comment,
 	}
+	addSecretTimes(attrs, secret.Created, secret.Modified)
 	if len(secret.Scopes) > 0 {
 		attrs["scopes"] = strings.Join(secret.Scopes, ",")
 	}
@@ -246,4 +222,15 @@ func (p *CloudflareProvider) secretStoreSecretResource(accountID, storeID, store
 		resource.ModifiedAt = timestamppb.New(secret.Modified)
 	}
 	return resource
+}
+
+// addSecretTimes records when a secret was created and last modified (its last rotation) as
+// attributes. Storage writes created_at and modified_at as scan times, so packs read these.
+func addSecretTimes(attrs map[string]string, created, modified time.Time) {
+	if !created.IsZero() {
+		attrs["created_on"] = created.UTC().Format(time.RFC3339)
+	}
+	if !modified.IsZero() {
+		attrs["modified_on"] = modified.UTC().Format(time.RFC3339)
+	}
 }

@@ -855,8 +855,12 @@ corkscrew scan --provider aws --services s3,ec2,lambda --region us-east-1,us-wes
 #### Output Formats
 
 ```bash
-# Table format (default)
+# Table format (default): resource counts by service and type, then the scan ID
+# and the command to evaluate it
 corkscrew scan --provider aws --output table
+
+# Table format with one row per resource
+corkscrew scan --provider aws --list-resources
 
 # JSON format for processing
 corkscrew scan --provider aws --output json
@@ -1023,7 +1027,16 @@ corkscrew query --file analysis.sql
 
 # Query from stdin
 echo "SELECT * FROM azure_resources WHERE type = 'VirtualMachine'" | corkscrew query --stdin
+
+# Run SQL you did not write without host file or network access
+corkscrew query --sandbox --file shared.sql
 ```
+
+Ad hoc queries can read local files (for example `read_csv('local.csv')`).
+`--sandbox` turns that off: `read_text`, `read_csv`, `COPY`, `ATTACH`, URLs and
+extension loading all fail with a DuckDB permission error, and the setting is
+locked for the session. Compliance packs and `corkscrew graph` always run
+sandboxed.
 
 #### Understanding the Schema
 
@@ -1229,6 +1242,38 @@ corkscrew query --control aws/s3/encryption \
 # Export compliance results
 corkscrew query --pack aws-cis --output csv > compliance_report.csv
 ```
+
+Corkscrew ships Cloudflare Workers packs (`cloudflare/workers-baseline`,
+`cloudflare/workers-bindings`, `cloudflare/workers-secrets`). See
+[packs/cloudflare-workers.md](packs/cloudflare-workers.md) for their controls and parameters.
+
+Pack SQL runs sandboxed, since packs can come from external git or OCI
+sources: it can read the corkscrew database but not host files or the network.
+Each query is cancelled after two minutes.
+
+#### Installing Packs and Verification
+
+`corkscrew pack install <namespace/pack>` downloads the pack's release asset and checks it
+against the SHA-256 that the release publishes (`checksums.txt` or `<asset>.sha256`). Pack
+authors can find the release format in [PACK_PUBLISHING.md](PACK_PUBLISHING.md).
+
+- **No published checksum.** The install fails. To install anyway, pass `--allow-unverified`.
+  Corkscrew prints a warning and installs the pack.
+- **Checksum mismatch or malformed checksum file.** The install always fails.
+- **Pinning.** Each installed version's SHA-256 is recorded in `corkscrew-lock.json`, in the
+  pack directory (`~/.corkscrew/query-packs/` or `--dest`). The file is keyed by source
+  (`github.com/<owner>/<repo>`), then by version. A later download of a pinned version that
+  hashes differently fails, even with `--allow-unverified`.
+- **Re-pinning.** `--force` only reinstalls over an existing pack directory. It never accepts a
+  changed hash. If a publisher re-released a version on purpose and you trust the change, re-pin
+  it explicitly:
+
+  ```bash
+  corkscrew pack install --force --repin --version v1.0.0 jlgore/cfi-ccc
+  ```
+
+  Corkscrew prints the old and new hashes when it re-pins. Deleting `corkscrew-lock.json`
+  drops every pin in that directory.
 
 #### Writing Custom Compliance Queries
 

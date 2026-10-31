@@ -13,7 +13,7 @@ import (
 // runScanE is the CLI adapter for the scan application workflow. It owns flag
 // syntax only; normalization, environment precedence, and execution live in
 // internal/app/scan.
-func runScanE(args []string) error {
+func runScanE(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 
@@ -24,6 +24,8 @@ func runScanE(args []string) error {
 	configPath := fs.String("config", "", "Path to configuration file")
 	concurrency := fs.Int("concurrency", 3, "Number of regions to scan concurrently")
 	saveToFile := fs.Bool("save", false, "Save results to timestamped JSON file")
+	listResources := fs.Bool("list-resources", false,
+		"Table output only: list each resource instead of counts by service and type")
 	databasePath := fs.String("database", "", "Path to DuckDB database file, or a quack: URI for a remote server (default: config database.path or ~/.corkscrew/db/corkscrew.duckdb)")
 	quackToken := fs.String("token", "", "Auth token for a remote quack: database (or CORKSCREW_QUACK_TOKEN)")
 	dbProviderTable := fs.String("db-provider-table", "", "Override target table for persistence (routes all rows)")
@@ -47,6 +49,7 @@ func runScanE(args []string) error {
 		Services:                *servicesStr,
 		OutputFormat:            *outputFormat,
 		SaveToFile:              *saveToFile,
+		ListResources:           *listResources,
 		ConfigPath:              *configPath,
 		MaxConcurrency:          *concurrency,
 		DatabasePath:            *databasePath,
@@ -60,7 +63,7 @@ func runScanE(args []string) error {
 		KubeContext:             *kubeContext,
 		IncludeRelationships:    *includeRels,
 	}
-	outcome, workflowErr := scanapp.Run(context.Background(), request, scanapp.Dependencies{})
+	outcome, workflowErr := scanapp.Run(ctx, request, scanapp.Dependencies{})
 	if outcome.Status != "" {
 		if err := renderScanOutcome(os.Stdout, os.Stderr, request, outcome); err != nil {
 			return err
