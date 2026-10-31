@@ -7,10 +7,11 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/jlgore/corkscrew/internal/assert"
 	providercatalog "github.com/jlgore/corkscrew/pkg/providers"
 )
 
-const LatestSchemaVersion = 6
+const LatestSchemaVersion = 7
 
 var schemaIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
@@ -103,6 +104,17 @@ CREATE TABLE IF NOT EXISTS corkscrew_schema_migrations (
 			return fmt.Errorf("record schema version 6: %w", err)
 		}
 	}
+
+	if version < 7 {
+		if err := migrateSchemaV7(ctx, tx); err != nil {
+			return fmt.Errorf("migrate schema to version 7: %w", err)
+		}
+		const record = `INSERT INTO corkscrew_schema_migrations(version, name)
+			VALUES (7, 'observation_resource_times')`
+		if _, err := tx.ExecContext(ctx, record); err != nil {
+			return fmt.Errorf("record schema version 7: %w", err)
+		}
+	}
 	// Query helpers are replaceable session contracts. Re-establish them even
 	// when a manually repaired migration ledger contains a later version.
 	if err := migrateSchemaV3(ctx, tx); err != nil {
@@ -111,6 +123,19 @@ CREATE TABLE IF NOT EXISTS corkscrew_schema_migrations (
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit schema migration: %w", err)
+	}
+	return nil
+}
+
+// migrateSchemaV7 records each observed resource's own creation and modification times, so
+// finding evaluation's snapshot can carry them to packs. Observations from earlier scans keep
+// NULL: their times were never recorded.
+func migrateSchemaV7(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `
+ALTER TABLE resource_observations ADD COLUMN IF NOT EXISTS created_at TIMESTAMP;
+ALTER TABLE resource_observations ADD COLUMN IF NOT EXISTS modified_at TIMESTAMP;
+`); err != nil {
+		return fmt.Errorf("add resource times to observations: %w", err)
 	}
 	return nil
 }
@@ -394,7 +419,7 @@ func migrateSchemaV1(ctx context.Context, db *sql.DB, tx *sql.Tx) error {
 			} else if existing != "" {
 				return fmt.Errorf("cannot archive %s: %s already exists", name, archive)
 			}
-			if _, err := tx.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", quoteSchemaIdentifier(name), quoteSchemaIdentifier(archive))); err != nil {
+			if err := renameLegacyTable(ctx, tx, name, archive); err != nil {
 				return fmt.Errorf("archive %s: %w", name, err)
 			}
 			legacyRelationships = append(legacyRelationships, provider)
@@ -540,10 +565,48 @@ func archiveLegacyTable(ctx context.Context, tx *sql.Tx, table, archive, canonic
 	} else if existing != "" {
 		return false, fmt.Errorf("cannot archive %s: %s already exists", table, archive)
 	}
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", quoteSchemaIdentifier(table), quoteSchemaIdentifier(archive))); err != nil {
+	if err := renameLegacyTable(ctx, tx, table, archive); err != nil {
 		return false, fmt.Errorf("archive %s: %w", table, err)
 	}
 	return true, nil
+}
+
+// renameLegacyTable moves a pre-lifecycle table aside as its archive. DuckDB can't rename a table
+// that has indexes, and older databases indexed their tables, so the table's own indexes are
+// dropped first: the archive is only read once, to copy its rows into the canonical tables.
+func renameLegacyTable(ctx context.Context, tx *sql.Tx, table, archive string) error {
+	indexes, err := legacyTableIndexes(ctx, tx, table)
+	if err != nil {
+		return fmt.Errorf("list indexes of %s: %w", table, err)
+	}
+	for _, index := range indexes {
+		statement := "DROP INDEX IF EXISTS " + quoteSchemaIdentifier(index)
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("drop index %s of %s: %w", index, table, err)
+		}
+	}
+	statement := fmt.Sprintf("ALTER TABLE %s RENAME TO %s",
+		quoteSchemaIdentifier(table), quoteSchemaIdentifier(archive))
+	_, err = tx.ExecContext(ctx, statement)
+	return err
+}
+
+func legacyTableIndexes(ctx context.Context, tx *sql.Tx, table string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT index_name FROM duckdb_indexes()
+		WHERE table_name = ? AND schema_name = current_schema()`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var indexes []string
+	for rows.Next() {
+		var index string
+		if err := rows.Scan(&index); err != nil {
+			return nil, err
+		}
+		indexes = append(indexes, index)
+	}
+	return indexes, rows.Err()
 }
 
 func schemaObjectKind(ctx context.Context, tx *sql.Tx, name string) (string, error) {
@@ -576,9 +639,8 @@ func schemaColumns(ctx context.Context, tx *sql.Tx, table string) (map[string]bo
 }
 
 func quoteSchemaIdentifier(name string) string {
-	if !schemaIdentifier.MatchString(name) {
-		panic("unsafe schema identifier: " + name)
-	}
+	// Callers build names from the official provider catalog and literals, never user input.
+	assert.Thatf(schemaIdentifier.MatchString(name), "db: safe schema identifier: %q", name)
 	return `"` + name + `"`
 }
 
@@ -694,7 +756,7 @@ func archiveLegacyNamedTable(ctx context.Context, tx *sql.Tx, table string) (boo
 	} else if existing != "" {
 		return false, fmt.Errorf("cannot archive %s: %s already exists", table, archive)
 	}
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", quoteSchemaIdentifier(table), quoteSchemaIdentifier(archive))); err != nil {
+	if err := renameLegacyTable(ctx, tx, table, archive); err != nil {
 		return false, fmt.Errorf("archive %s: %w", table, err)
 	}
 	return true, nil
