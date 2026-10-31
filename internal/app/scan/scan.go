@@ -20,6 +20,7 @@ import (
 	pb "github.com/jlgore/corkscrew/internal/proto"
 	providerRuntime "github.com/jlgore/corkscrew/internal/provider"
 	"github.com/jlgore/corkscrew/internal/scanexec"
+	"github.com/jlgore/corkscrew/internal/shared"
 )
 
 type Request struct {
@@ -30,6 +31,7 @@ type Request struct {
 	ConfigPath              string
 	MaxConcurrency          int
 	SaveToFile              bool
+	ListResources           bool
 	DatabasePath            string
 	DatabaseExplicit        bool
 	QuackToken              string
@@ -60,7 +62,17 @@ type WarningKind string
 const (
 	WarningPersistence WarningKind = "persistence"
 	WarningRuntime     WarningKind = "runtime"
+	// WarningCoverage reports permission gaps and disabled features: the scan is complete for
+	// what the credential can see, and widening it is the user's call.
+	WarningCoverage WarningKind = "coverage"
+	// WarningIncomplete reports scope errors: resources may be missing, so the scan is partial
+	// and does not resolve findings (ADR 0023).
+	WarningIncomplete WarningKind = "incomplete"
 )
+
+// warningExamplesMax bounds how many entries a summary warning quotes; the full list is in the
+// scope results (for example with --output json).
+const warningExamplesMax = 3
 
 type Warning struct {
 	Kind    WarningKind
@@ -77,6 +89,7 @@ type ScopeResult struct {
 	Resources []*pb.Resource
 	Stats     *pb.ScanStats
 	Errors    []string
+	Notices   []string
 	Duration  time.Duration
 }
 
@@ -92,8 +105,13 @@ type Outcome struct {
 	Warnings   []Warning
 	Expansions []ServiceGroupExpansion
 	Persisted  bool
+	// Database is the target the scan was stored in, when Persisted.
+	Database string
 }
 
+// serviceGroups name sets of AWS services. Other providers have their own
+// service names, some of which collide with group names (Azure, GCP, and
+// Cloudflare each have a "storage" service), so groups expand only for AWS.
 var serviceGroups = map[string][]string{
 	"compute":    {"ec2", "lambda", "ecs", "eks", "batch"},
 	"storage":    {"s3", "ebs", "efs", "fsx", "backup"},
@@ -179,9 +197,11 @@ func Run(ctx context.Context, request Request, dependencies Dependencies) (Outco
 	for index, scope := range execution.Scopes {
 		outcome.Scopes[index] = ScopeResult{
 			Scope: scope.Scope, Resources: scope.Resources, Stats: scope.Stats,
-			Errors: append([]string(nil), scope.Errors...), Duration: scope.Duration,
+			Errors: append([]string(nil), scope.Errors...), Notices: append([]string(nil), scope.Notices...),
+			Duration: scope.Duration,
 		}
 	}
+	outcome.Warnings = append(outcome.Warnings, scopeWarnings(outcome.Scopes)...)
 	if message := strings.TrimSpace(runtimeWarnings.String()); message != "" {
 		outcome.Warnings = append(outcome.Warnings, Warning{Kind: WarningRuntime, Message: message})
 	}
@@ -199,6 +219,7 @@ func Run(ctx context.Context, request Request, dependencies Dependencies) (Outco
 			outcome.Warnings = append(outcome.Warnings, Warning{Kind: WarningPersistence, Message: persistErr.Error()})
 		} else {
 			outcome.Persisted = true
+			outcome.Database = persistenceTarget
 		}
 	}
 
@@ -249,8 +270,8 @@ func Prepare(request Request, getenv func(string) string) (PreparedRequest, []Se
 	if getenv == nil {
 		getenv = func(string) string { return "" }
 	}
-	services, expansions := ExpandServices(request.Services)
 	request.Provider = strings.TrimSpace(request.Provider)
+	services, expansions := ExpandServices(request.Provider, request.Services)
 	request.ConfigPath = strings.TrimSpace(request.ConfigPath)
 	request.DatabasePath = strings.TrimSpace(request.DatabasePath)
 	if request.DatabasePath == "" {
@@ -324,7 +345,7 @@ func installedDescriptor(descriptors []providerRuntime.Descriptor, name string) 
 	return providerRuntime.Descriptor{}, false
 }
 
-func ExpandServices(value string) ([]string, []ServiceGroupExpansion) {
+func ExpandServices(provider, value string) ([]string, []ServiceGroupExpansion) {
 	if strings.TrimSpace(value) == "" {
 		return nil, nil
 	}
@@ -335,7 +356,7 @@ func ExpandServices(value string) ([]string, []ServiceGroupExpansion) {
 		if item == "" {
 			continue
 		}
-		if group, exists := serviceGroups[item]; exists {
+		if group, exists := serviceGroups[item]; exists && provider == "aws" {
 			services := append([]string(nil), group...)
 			expansions = append(expansions, ServiceGroupExpansion{Name: item, Services: services})
 			expanded = append(expanded, services...)
@@ -380,4 +401,45 @@ func splitList(value string) []string {
 		}
 	}
 	return result
+}
+
+// scopeWarnings summarizes coverage notices and scope errors into at most one warning each, so a
+// large scan reports its gaps in two lines rather than one line per resource type.
+func scopeWarnings(scopes []ScopeResult) []Warning {
+	var coverage, incomplete []string
+	for _, scope := range scopes {
+		for _, notice := range scope.Notices {
+			if shared.IsCoverageNotice(notice) {
+				coverage = append(coverage, scope.Scope+": "+notice)
+			}
+		}
+		for _, entry := range scope.Errors {
+			incomplete = append(incomplete, scope.Scope+": "+entry)
+		}
+	}
+	var warnings []Warning
+	if len(coverage) > 0 {
+		warnings = append(warnings, Warning{Kind: WarningCoverage, Message: fmt.Sprintf(
+			"%d item(s) are not readable with these credentials or are disabled; the scan covers "+
+				"everything else. Grant access to widen it. Examples: %s",
+			len(coverage), examples(coverage))})
+	}
+	if len(incomplete) > 0 {
+		warnings = append(warnings, Warning{Kind: WarningIncomplete, Message: fmt.Sprintf(
+			"%d error(s) mean resources may be missing; the scan is partial and will not resolve "+
+				"findings. Examples: %s", len(incomplete), examples(incomplete))})
+	}
+	return warnings
+}
+
+func examples(entries []string) string {
+	shown := entries
+	if len(shown) > warningExamplesMax {
+		shown = shown[:warningExamplesMax]
+	}
+	text := strings.Join(shown, "; ")
+	if hidden := len(entries) - len(shown); hidden > 0 {
+		text += fmt.Sprintf("; and %d more", hidden)
+	}
+	return text
 }

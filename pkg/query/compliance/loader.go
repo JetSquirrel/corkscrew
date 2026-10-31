@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jlgore/corkscrew/internal/assert"
 	"gopkg.in/yaml.v3"
 )
 
@@ -222,13 +224,28 @@ func (l *PackLoader) LoadPack(ctx context.Context, namespace string) (*QueryPack
 	return l.loadPackInternal(ctx, namespace, make(map[string]bool), make([]string, 0))
 }
 
+// packDepthMax bounds a pack's dependency chain, counting the pack itself. Real packs depend on
+// one or two shared packs; the bound keeps the recursive load from growing without limit on a
+// long (generated or hostile) chain of distinct manifests.
+const packDepthMax = 32
+
 // loadPackInternal loads a pack with dependency tracking to prevent circular dependencies
 func (l *PackLoader) loadPackInternal(ctx context.Context, namespace string, loading map[string]bool, loadPath []string) (*QueryPack, error) {
+	assert.Thatf(len(loadPath) <= packDepthMax,
+		"compliance: load path of %d packs is within packDepthMax %d", len(loadPath), packDepthMax)
 	// Check for circular dependencies
 	if loading[namespace] {
 		return nil, DependencyError{
 			PackName: namespace,
 			Circular: append(loadPath, namespace),
+		}
+	}
+	// Manifests are user files, so an over-deep chain is an operating error, not an assertion.
+	if len(loadPath) >= packDepthMax {
+		return nil, LoaderError{
+			PackName: namespace,
+			Message: fmt.Sprintf("dependency chain deeper than %d packs: %s", packDepthMax,
+				strings.Join(append(loadPath, namespace), " -> ")),
 		}
 	}
 
@@ -241,6 +258,7 @@ func (l *PackLoader) loadPackInternal(ctx context.Context, namespace string, loa
 
 	loading[namespace] = true
 	loadPath = append(loadPath, namespace)
+	assert.That(len(loadPath) <= packDepthMax, "compliance: load path is within packDepthMax")
 	defer func() {
 		delete(loading, namespace)
 	}()
@@ -250,7 +268,7 @@ func (l *PackLoader) loadPackInternal(ctx context.Context, namespace string, loa
 	if err != nil {
 		return nil, LoaderError{
 			PackName: namespace,
-			Message:  "manifest not found",
+			Message:  "manifest unavailable",
 			Cause:    err,
 		}
 	}
@@ -312,22 +330,31 @@ func (l *PackLoader) findPackManifest(ctx context.Context, namespace string) (*P
 		return manifest, manifest.LoadedFrom, nil
 	}
 
-	// Search in filesystem paths
+	// Search in filesystem paths. A manifest that exists but can't be read or parsed is an
+	// error, not a miss: reporting "not found" would hide the reason from the pack's author.
 	for _, searchPath := range l.searchPaths {
 		manifestPath := l.getManifestPath(searchPath, namespace)
-		if manifest, err := l.loadManifestFromFile(manifestPath); err == nil {
+		manifest, err := l.loadManifestFromFile(manifestPath)
+		if err == nil {
 			l.manifestCache[namespace] = manifest
 			return manifest, manifestPath, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return nil, "", fmt.Errorf("load manifest %s: %w", manifestPath, err)
 		}
 	}
 
 	// Search in embedded packs
 	if l.enableEmbeddedPacks {
-		embeddedPath := fmt.Sprintf("packs/%s/manifest.yaml", strings.ReplaceAll(namespace, "/", "/"))
-		if manifest, err := l.loadManifestFromEmbedded(embeddedPath); err == nil {
+		embeddedPath := fmt.Sprintf("packs/%s/manifest.yaml", namespace)
+		manifest, err := l.loadManifestFromEmbedded(embeddedPath)
+		if err == nil {
 			manifest.LoadedFrom = embeddedPath
 			l.manifestCache[namespace] = manifest
 			return manifest, embeddedPath, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return nil, "", fmt.Errorf("load embedded manifest %s: %w", embeddedPath, err)
 		}
 	}
 

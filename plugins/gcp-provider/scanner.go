@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
 
+	"github.com/jlgore/corkscrew/internal/assert"
 	pb "github.com/jlgore/corkscrew/internal/proto"
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/storage/v1"
@@ -19,6 +21,8 @@ type ResourceScanner struct {
 	clientFactory  *ClientFactory
 	assetInventory *AssetInventoryClient
 	scanners       map[string]ServiceScanner
+	// concurrency caps the service scans ScanAllServices runs at once.
+	concurrency int
 }
 
 // ServiceScanner interface for service-specific scanners
@@ -27,11 +31,14 @@ type ServiceScanner interface {
 	DescribeResource(ctx context.Context, resourceID string) (*pb.Resource, error)
 }
 
-// NewResourceScanner creates a new resource scanner
-func NewResourceScanner(cf *ClientFactory) *ResourceScanner {
+// NewResourceScanner creates a new resource scanner that runs at most
+// concurrency service scans at once.
+func NewResourceScanner(cf *ClientFactory, concurrency int) *ResourceScanner {
+	assert.That(concurrency > 0, "gcp: resource scanner concurrency is positive")
 	rs := &ResourceScanner{
 		clientFactory: cf,
 		scanners:      make(map[string]ServiceScanner),
+		concurrency:   concurrency,
 	}
 
 	// Register service-specific scanners
@@ -53,29 +60,31 @@ func (rs *ResourceScanner) registerScanners() {
 	// Add more scanners as needed
 }
 
-// ScanService scans resources for a specific service
+// ScanService scans resources for a specific service. It may return resources together with an
+// error: the resources were observed, but the service was not fully observed.
 func (rs *ResourceScanner) ScanService(ctx context.Context, service string) ([]*pb.ResourceRef, error) {
-	// Try Asset Inventory first if available
+	scanner, hasScanner := rs.scanners[service]
 	if rs.assetInventory != nil {
 		assetTypes := mapServiceToAssetTypes(service)
 		resources, err := rs.assetInventory.QueryAssetsByType(ctx, assetTypes)
 		if err == nil {
 			return resources, nil
 		}
-		// Fall back to API scanning on error
+		// Without an API scanner to fall back on, the partial Asset Inventory listing is the
+		// best observation available; keep it and report the failure.
+		if !hasScanner {
+			return resources, fmt.Errorf("asset inventory for service %s: %w", service, err)
+		}
 		log.Printf("Asset Inventory failed for service %s, falling back to API: %v", service, err)
 	}
-
-	// Use service-specific scanner
-	scanner, ok := rs.scanners[service]
-	if !ok {
+	if !hasScanner {
 		return nil, fmt.Errorf("no scanner available for service: %s", service)
 	}
-
 	return scanner.Scan(ctx)
 }
 
-// ScanAllServices scans resources across all enabled services
+// ScanAllServices scans resources across all enabled services. Resources from every service are
+// returned, including those from a service that failed part way, with the failures joined.
 func (rs *ResourceScanner) ScanAllServices(ctx context.Context) ([]*pb.ResourceRef, error) {
 	// Try Asset Inventory first if available
 	if rs.assetInventory != nil {
@@ -87,14 +96,43 @@ func (rs *ResourceScanner) ScanAllServices(ctx context.Context) ([]*pb.ResourceR
 		log.Printf("Asset Inventory failed, falling back to API scanning: %v", err)
 	}
 
-	// Scan all services concurrently
+	resultChan, errs := rs.launchServiceScans(ctx)
+
+	var allResources []*pb.ResourceRef
+	for result := range resultChan {
+		allResources = append(allResources, result.resources...)
+		if result.err != nil {
+			errs = append(errs, fmt.Errorf("service %s: %w", result.service, result.err))
+		}
+	}
+	return allResources, errors.Join(errs...)
+}
+
+// launchServiceScans starts every service scan, at most rs.concurrency at a
+// time, and returns a channel of their results that closes once all launched
+// scans finish. The slot is taken before the goroutine starts, so goroutines
+// are bounded too. Once ctx ends no further scan starts; each service left
+// unlaunched gets a ctx.Err() error, so the scan is reported partial instead
+// of those services vanishing (ADR 0023).
+func (rs *ResourceScanner) launchServiceScans(
+	ctx context.Context,
+) (<-chan scanServiceResult, []error) {
+	assert.That(rs.concurrency > 0, "gcp: resource scanner concurrency is positive")
 	var wg sync.WaitGroup
+	slots := make(chan struct{}, rs.concurrency)
 	resultChan := make(chan scanServiceResult, len(rs.scanners))
+	var notLaunched []error
 
 	for serviceName, scanner := range rs.scanners {
+		if !acquireSlot(ctx, slots) {
+			notLaunched = append(notLaunched,
+				fmt.Errorf("service %s: not scanned: %w", serviceName, ctx.Err()))
+			continue
+		}
 		wg.Add(1)
 		go func(name string, s ServiceScanner) {
 			defer wg.Done()
+			defer func() { <-slots }()
 
 			resources, err := s.Scan(ctx)
 			resultChan <- scanServiceResult{
@@ -109,29 +147,41 @@ func (rs *ResourceScanner) ScanAllServices(ctx context.Context) ([]*pb.ResourceR
 		wg.Wait()
 		close(resultChan)
 	}()
-
-	// Collect results
-	var allResources []*pb.ResourceRef
-	for result := range resultChan {
-		if result.err != nil {
-			log.Printf("Error scanning %s: %v", result.service, result.err)
-			continue
-		}
-		allResources = append(allResources, result.resources...)
-	}
-
-	return allResources, nil
+	assert.That(len(notLaunched) == 0 || ctx.Err() != nil,
+		"gcp: services are left unlaunched only once ctx ends")
+	return resultChan, notLaunched
 }
 
-// StreamScanResources streams resources as they are discovered
+// acquireSlot takes a slot unless ctx has ended, reporting whether it did.
+// select picks at random when both cases are ready, so ctx is checked before
+// and again after taking a slot: a scan must never start after cancellation.
+func acquireSlot(ctx context.Context, slots chan struct{}) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	select {
+	case slots <- struct{}{}:
+	case <-ctx.Done():
+		return false
+	}
+	if ctx.Err() != nil {
+		<-slots
+		return false
+	}
+	return true
+}
+
+// StreamScanResources streams resources as they are discovered. It owns resourceChan
+// and closes it on return; callers must only receive. A failed service does not stop the
+// others, but its error is returned so the stream does not end as if the scan were complete.
 func (rs *ResourceScanner) StreamScanResources(ctx context.Context, services []string, resourceChan chan<- *pb.Resource) error {
 	defer close(resourceChan)
 
+	var errs []error
 	for _, service := range services {
 		refs, err := rs.ScanService(ctx, service)
 		if err != nil {
-			log.Printf("Error scanning service %s: %v", service, err)
-			continue
+			errs = append(errs, fmt.Errorf("service %s: %w", service, err))
 		}
 
 		for _, ref := range refs {
@@ -144,7 +194,7 @@ func (rs *ResourceScanner) StreamScanResources(ctx context.Context, services []s
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // DescribeResource gets detailed information about a specific resource
@@ -173,6 +223,7 @@ func (cs *ComputeScanner) Scan(ctx context.Context) ([]*pb.ResourceRef, error) {
 	}
 
 	var resources []*pb.ResourceRef
+	var errs []error
 	projectIDs := cs.clientFactory.GetProjectIDs()
 
 	for _, projectID := range projectIDs {
@@ -208,7 +259,7 @@ func (cs *ComputeScanner) Scan(ctx context.Context) ([]*pb.ResourceRef, error) {
 			}
 			return nil
 		}); err != nil {
-			log.Printf("Failed to list instances for project %s: %v", projectID, err)
+			errs = append(errs, fmt.Errorf("list instances for project %s: %w", projectID, err))
 			continue
 		}
 
@@ -245,7 +296,7 @@ func (cs *ComputeScanner) Scan(ctx context.Context) ([]*pb.ResourceRef, error) {
 			}
 			return nil
 		}); err != nil {
-			log.Printf("Failed to list disks for project %s: %v", projectID, err)
+			errs = append(errs, fmt.Errorf("list disks for project %s: %w", projectID, err))
 			continue
 		}
 
@@ -273,7 +324,7 @@ func (cs *ComputeScanner) Scan(ctx context.Context) ([]*pb.ResourceRef, error) {
 			}
 			return nil
 		}); err != nil {
-			log.Printf("Failed to list networks for project %s: %v", projectID, err)
+			errs = append(errs, fmt.Errorf("list networks for project %s: %w", projectID, err))
 			continue
 		}
 
@@ -308,12 +359,12 @@ func (cs *ComputeScanner) Scan(ctx context.Context) ([]*pb.ResourceRef, error) {
 			}
 			return nil
 		}); err != nil {
-			log.Printf("Failed to list subnetworks for project %s: %v", projectID, err)
+			errs = append(errs, fmt.Errorf("list subnetworks for project %s: %w", projectID, err))
 			continue
 		}
 	}
 
-	return resources, nil
+	return resources, errors.Join(errs...)
 }
 
 func (cs *ComputeScanner) DescribeResource(ctx context.Context, resourceID string) (*pb.Resource, error) {
@@ -418,6 +469,7 @@ func (ss *StorageScanner) Scan(ctx context.Context) ([]*pb.ResourceRef, error) {
 	}
 
 	var resources []*pb.ResourceRef
+	var errs []error
 	projectIDs := ss.clientFactory.GetProjectIDs()
 
 	for _, projectID := range projectIDs {
@@ -448,12 +500,12 @@ func (ss *StorageScanner) Scan(ctx context.Context) ([]*pb.ResourceRef, error) {
 			}
 			return nil
 		}); err != nil {
-			log.Printf("Failed to list buckets for project %s: %v", projectID, err)
+			errs = append(errs, fmt.Errorf("list buckets for project %s: %w", projectID, err))
 			continue
 		}
 	}
 
-	return resources, nil
+	return resources, errors.Join(errs...)
 }
 
 func (ss *StorageScanner) DescribeResource(ctx context.Context, resourceID string) (*pb.Resource, error) {
@@ -517,6 +569,7 @@ func (cs *ContainerScanner) Scan(ctx context.Context) ([]*pb.ResourceRef, error)
 	}
 
 	var resources []*pb.ResourceRef
+	var errs []error
 	projectIDs := cs.clientFactory.GetProjectIDs()
 
 	for _, projectID := range projectIDs {
@@ -524,7 +577,7 @@ func (cs *ContainerScanner) Scan(ctx context.Context) ([]*pb.ResourceRef, error)
 		parent := fmt.Sprintf("projects/%s/locations/-", projectID)
 		resp, err := client.Projects.Locations.Clusters.List(parent).Context(ctx).Do()
 		if err != nil {
-			log.Printf("Failed to list clusters for project %s: %v", projectID, err)
+			errs = append(errs, fmt.Errorf("list clusters for project %s: %w", projectID, err))
 			continue
 		}
 
@@ -579,7 +632,7 @@ func (cs *ContainerScanner) Scan(ctx context.Context) ([]*pb.ResourceRef, error)
 		}
 	}
 
-	return resources, nil
+	return resources, errors.Join(errs...)
 }
 
 func (cs *ContainerScanner) DescribeResource(ctx context.Context, resourceID string) (*pb.Resource, error) {
